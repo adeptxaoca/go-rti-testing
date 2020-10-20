@@ -19,6 +19,10 @@ type CalculateRequest struct {
 	Conditions []Condition `json:"conditions"`
 }
 
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", ping)
@@ -68,22 +72,37 @@ func decodeJson(req *http.Request, dst interface{}) error {
 	return nil
 }
 
+func encodeJson(w http.ResponseWriter, v interface{}) error {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		return errors.Internal.Wrap(err, "json.NewEncoder(w).Encode(offer)")
+	}
+	return nil
+}
+
+func newErrorResponse(message string) *ErrorResponse {
+	return &ErrorResponse{
+		Error: message,
+	}
+}
+
 func httpError(w http.ResponseWriter, err error) {
+	var status int
 	switch errors.GetType(err) {
 	case errors.UnsupportedMediaType:
-		w.WriteHeader(http.StatusUnsupportedMediaType)
-		_, _ = fmt.Fprintf(w, errors.MsgUnsupportedMediaType, err.Error())
+		status = http.StatusUnsupportedMediaType
+		_ = encodeJson(w, newErrorResponse(fmt.Sprintf(errors.MsgUnsupportedMediaType, err.Error())))
 	case errors.MethodNotAllowed:
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_, _ = w.Write([]byte(http.StatusText(http.StatusMethodNotAllowed)))
+		status = http.StatusMethodNotAllowed
 	case errors.BadRequest:
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(err.Error()))
+		status = http.StatusBadRequest
+		_ = encodeJson(w, newErrorResponse(err.Error()))
 	default:
+		status = http.StatusInternalServerError
 		log.Printf("ERROR %s", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+		_ = encodeJson(w, newErrorResponse(http.StatusText(http.StatusInternalServerError)))
 	}
+	w.WriteHeader(status)
 }
 
 func ping(w http.ResponseWriter, _ *http.Request) {
@@ -109,9 +128,8 @@ func calculate(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if offer != nil {
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(offer); err != nil {
-			httpError(w, errors.Internal.Wrap(err, "json.NewEncoder(w).Encode(offer)"))
+		if err := encodeJson(w, offer); err != nil {
+			httpError(w, err)
 			return
 		}
 	}

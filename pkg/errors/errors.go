@@ -20,7 +20,7 @@ const (
 )
 
 const (
-	MsgUnsupportedMediaType = "content-type header is not %s"
+	MsgUnsupportedMediaType = "content-type header is not '%s'"
 )
 
 type Error struct {
