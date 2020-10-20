@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
+
+	"github.com/felixge/httpsnoop"
+
+	"go-rti-testing/pkg/errors"
 )
 
 type CalculateRequest struct {
@@ -24,7 +24,7 @@ func main() {
 	mux.HandleFunc("/ping", ping)
 	mux.HandleFunc("/calculate", calculate)
 
-	srv := http.Server{Addr: ":8080", Handler: mux}
+	srv := http.Server{Addr: ":8080", Handler: logRequest(mux)}
 	idleConnsClosed := make(chan struct{})
 	go func() {
 		sigint := make(chan os.Signal, 1)
@@ -45,213 +45,74 @@ func main() {
 	<-idleConnsClosed
 }
 
+func logRequest(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m := httpsnoop.CaptureMetrics(handler, w, r)
+		log.Printf(
+			"method=%s path=%s status=%d duration=%s written=%d",
+			r.Method, r.URL, m.Code, m.Duration, m.Written,
+		)
+	})
+}
+
+func decodeJson(req *http.Request, dst interface{}) error {
+	if contentType := req.Header.Get("Content-Type"); contentType != "application/json" {
+		return errors.UnsupportedMediaType.New("application/json")
+	}
+
+	err := json.NewDecoder(req.Body).Decode(dst)
+	if err != nil {
+		return errors.BadRequest.New("invalid request body")
+	}
+
+	return nil
+}
+
+func httpError(w http.ResponseWriter, err error) {
+	switch errors.GetType(err) {
+	case errors.UnsupportedMediaType:
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		_, _ = fmt.Fprintf(w, errors.MsgUnsupportedMediaType, err.Error())
+	case errors.MethodNotAllowed:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(http.StatusText(http.StatusMethodNotAllowed)))
+	case errors.BadRequest:
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(err.Error()))
+	default:
+		log.Printf("ERROR %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+	}
+}
+
 func ping(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprint(w, "pong")
 }
 
 func calculate(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		_, _ = w.Write([]byte(http.StatusText(http.StatusMethodNotAllowed)))
+		httpError(w, errors.MethodNotAllowed.New(""))
 		return
 	}
 
 	var calcReq CalculateRequest
-	if err := decodeJson(w, req, &calcReq); err != nil {
-		_, _ = w.Write([]byte(err.Error()))
+	if err := decodeJson(req, &calcReq); err != nil {
+		httpError(w, err)
 		return
 	}
 
 	offer, err := Calculate(&calcReq.Product, calcReq.Conditions)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(err.Error()))
+		httpError(w, err)
 		return
 	}
 
 	if offer != nil {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(offer); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+			httpError(w, errors.Internal.Wrap(err, "json.NewEncoder(w).Encode(offer)"))
 			return
 		}
 	}
-}
-
-func decodeJson(w http.ResponseWriter, req *http.Request, dst interface{}) error {
-	if contentType := req.Header.Get("Content-Type"); contentType != "application/json" {
-		w.WriteHeader(http.StatusUnsupportedMediaType)
-		return errors.New("content-type header is not application/json")
-	}
-
-	err := json.NewDecoder(req.Body).Decode(dst)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return errors.New("invalid request body")
-	}
-
-	return nil
-}
-
-func Calculate(product *Product, conditions []Condition) (offer *Offer, err error) {
-	if product == nil {
-		return
-	}
-
-	totalCost, components, err := componentSearch(product.Components, conditions)
-	if err != nil || totalCost == nil {
-		return
-	}
-
-	offer = &Offer{TotalCost: *totalCost}
-	offer.Product.Name = product.Name
-	offer.Product.Components = components
-
-	return offer, nil
-}
-
-// Function searches for suitable components and calculates total cost.
-func componentSearch(components []Component, conditions []Condition) (*Price, []Component, error) {
-	var totalCost float64
-	var relevant []Component
-
-	for _, component := range components {
-		valid, cost, err := validateComponent(component, conditions)
-		if err != nil {
-			return new(Price), nil, err
-		}
-
-		if !valid {
-			if component.IsMain {
-				return nil, nil, nil
-			}
-			continue
-		}
-
-		relevant = append(relevant,
-			Component{
-				Name:   component.Name,
-				IsMain: component.IsMain,
-				Prices: []Price{{Cost: cost}},
-			})
-		totalCost += cost
-	}
-
-	return &Price{Cost: totalCost}, relevant, nil
-}
-
-// Function checks the component and returns the discounted cost.
-func validateComponent(component Component, conditions []Condition) (bool, float64, error) {
-	var cost, discount float64
-
-	for _, price := range component.Prices {
-		match, err := check(price.RuleApplicabilities, conditions)
-		if err != nil {
-			return false, 0, err
-		}
-
-		switch strings.ToUpper(price.PriceType) {
-		case PriceTypeCost:
-			if !match {
-				continue
-			}
-			if cost > 0 {
-				return false, 0, nil
-			}
-			cost = price.Cost
-		case PriceTypeDiscount:
-			if match && discount < price.Cost {
-				discount = price.Cost
-			}
-		}
-	}
-
-	if cost == 0 {
-		return false, 0, nil
-	}
-
-	return true, discountedCost(cost, discount), nil
-}
-
-// Function checks conditions according to selected rules.
-// If there are no conditions or all conditions are met, then returns true.
-func check(rules []RuleApplicability, conditions []Condition) (bool, error) {
-	if len(conditions) == 0 {
-		return true, nil
-	}
-
-	ruleMap := make(map[string]RuleApplicability)
-	for _, rule := range rules {
-		ruleMap[strings.ToLower(rule.CodeName)] = rule
-	}
-
-	for _, condition := range conditions {
-		if rule, ok := ruleMap[strings.ToLower(condition.RuleName)]; ok {
-			met, err := conditionCheckByRule(condition, rule)
-			if err != nil || !met {
-				return false, err
-			}
-		}
-	}
-
-	return true, nil
-}
-
-// Function performs the condition check by the rule.
-// If the condition is fulfilled, then returns true.
-func conditionCheckByRule(condition Condition, rule RuleApplicability) (bool, error) {
-	switch rule.Operator {
-	case OperatorEqual:
-		return rule.Value == condition.Value, nil
-	case OperatorLessThanOrEqual:
-		return lessThanOrEqual(condition.Value, rule.Value)
-	case OperatorGreaterThanOrEqual:
-		return greaterThanOrEqual(condition.Value, rule.Value)
-	default:
-		return false, nil
-	}
-}
-
-// v1 <= v2
-func lessThanOrEqual(v1, v2 string) (bool, error) {
-	v1f, v2f, err := parseValues(v1, v2)
-	if err != nil {
-		return false, err
-	}
-
-	return v1f <= v2f, nil
-}
-
-// v1 >= v2
-func greaterThanOrEqual(v1, v2 string) (bool, error) {
-	v1f, v2f, err := parseValues(v1, v2)
-	if err != nil {
-		return false, err
-	}
-
-	return v1f >= v2f, nil
-}
-
-// string to float64
-func parseValues(a, b string) (float64, float64, error) {
-	af, err := strconv.ParseFloat(a, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	bf, err := strconv.ParseFloat(b, 64)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	return af, bf, nil
-}
-
-// Calculate discounted cost
-func discountedCost(cost, discount float64) float64 {
-	if discount > 100 {
-		discount = 100
-	}
-
-	return math.Round(cost*(100-discount)) / 100
 }
