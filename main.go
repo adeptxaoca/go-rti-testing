@@ -1,9 +1,73 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"math"
+	"net/http"
 	"strconv"
 )
+
+type CalculateRequest struct {
+	Product    Product     `json:"product"`
+	Conditions []Condition `json:"conditions"`
+}
+
+func main() {
+	http.HandleFunc("/ping", ping)
+	http.HandleFunc("/calculate", calculate)
+	log.Println("Starting http server on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func ping(w http.ResponseWriter, _ *http.Request) {
+	_, _ = fmt.Fprint(w, "pong")
+}
+
+func calculate(w http.ResponseWriter, req *http.Request) {
+	switch req.Method {
+	case http.MethodPost:
+		var calcReq CalculateRequest
+		if err := decodeJson(w, req, &calcReq); err != nil {
+			_, _ = w.Write([]byte(err.Error()))
+			return
+		}
+
+		offer, err := Calculate(&calcReq.Product, calcReq.Conditions)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if offer != nil {
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(offer); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+		}
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte("404 page not found"))
+	}
+}
+
+func decodeJson(w http.ResponseWriter, req *http.Request, dst interface{}) error {
+	if contentType := req.Header.Get("Content-Type"); contentType != "application/json" {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return errors.New("content-type header is not application/json")
+	}
+
+	err := json.NewDecoder(req.Body).Decode(dst)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return errors.New("invalid request body")
+	}
+
+	return nil
+}
 
 func Calculate(product *Product, conditions []Condition) (offer *Offer, err error) {
 	if product == nil {
