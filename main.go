@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"strings"
 )
 
 type CalculateRequest struct {
@@ -16,10 +20,29 @@ type CalculateRequest struct {
 }
 
 func main() {
-	http.HandleFunc("/ping", ping)
-	http.HandleFunc("/calculate", calculate)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", ping)
+	mux.HandleFunc("/calculate", calculate)
+
+	srv := http.Server{Addr: ":8080", Handler: mux}
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, os.Interrupt)
+		<-sigint
+
+		if err := srv.Shutdown(context.Background()); err != nil {
+			log.Printf("HTTP server Shutdown: %v", err)
+		}
+		close(idleConnsClosed)
+	}()
+
 	log.Println("Starting http server on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("HTTP server ListenAndServe: %v", err)
+	}
+
+	<-idleConnsClosed
 }
 
 func ping(w http.ResponseWriter, _ *http.Request) {
@@ -27,30 +50,31 @@ func ping(w http.ResponseWriter, _ *http.Request) {
 }
 
 func calculate(w http.ResponseWriter, req *http.Request) {
-	switch req.Method {
-	case http.MethodPost:
-		var calcReq CalculateRequest
-		if err := decodeJson(w, req, &calcReq); err != nil {
-			_, _ = w.Write([]byte(err.Error()))
+	if req.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = w.Write([]byte(http.StatusText(http.StatusMethodNotAllowed)))
+		return
+	}
+
+	var calcReq CalculateRequest
+	if err := decodeJson(w, req, &calcReq); err != nil {
+		_, _ = w.Write([]byte(err.Error()))
+		return
+	}
+
+	offer, err := Calculate(&calcReq.Product, calcReq.Conditions)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(err.Error()))
+		return
+	}
+
+	if offer != nil {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(offer); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-
-		offer, err := Calculate(&calcReq.Product, calcReq.Conditions)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		if offer != nil {
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(offer); err != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-		}
-	default:
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte("404 page not found"))
 	}
 }
 
@@ -126,7 +150,7 @@ func validateComponent(component Component, conditions []Condition) (bool, float
 			return false, 0, err
 		}
 
-		switch price.PriceType {
+		switch strings.ToUpper(price.PriceType) {
 		case PriceTypeCost:
 			if !match {
 				continue
@@ -142,6 +166,10 @@ func validateComponent(component Component, conditions []Condition) (bool, float
 		}
 	}
 
+	if cost == 0 {
+		return false, 0, nil
+	}
+
 	return true, discountedCost(cost, discount), nil
 }
 
@@ -154,11 +182,11 @@ func check(rules []RuleApplicability, conditions []Condition) (bool, error) {
 
 	ruleMap := make(map[string]RuleApplicability)
 	for _, rule := range rules {
-		ruleMap[rule.CodeName] = rule
+		ruleMap[strings.ToLower(rule.CodeName)] = rule
 	}
 
 	for _, condition := range conditions {
-		if rule, ok := ruleMap[condition.RuleName]; ok {
+		if rule, ok := ruleMap[strings.ToLower(condition.RuleName)]; ok {
 			met, err := conditionCheckByRule(condition, rule)
 			if err != nil || !met {
 				return false, err
@@ -225,5 +253,5 @@ func discountedCost(cost, discount float64) float64 {
 		discount = 100
 	}
 
-	return math.Ceil(cost*(100-discount)) / 100
+	return math.Round(cost*(100-discount)) / 100
 }
