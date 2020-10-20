@@ -2,7 +2,7 @@ package main
 
 const (
 	PriceTypeCost              = "COST"
-	PriceTypeDiscount          = "Discount"
+	PriceTypeDiscount          = "DISCOUNT"
 	OperatorEqual              = "EQ"
 	OperatorGreaterThanOrEqual = "GTE"
 	OperatorLessThanOrEqual    = "LTE"
